@@ -144,7 +144,9 @@ npm install
 npm run dev
 ```
 
-Abrir `http://localhost:3000` en el navegador.
+Abrir `http://localhost:3002` en el navegador.
+
+> Nota: el frontend usa el puerto **3002** en vez del 3000 por defecto de Next.js, porque el 3000 suele estar ocupado por Grafana.
 
 El frontend usa la variable `NEXT_PUBLIC_API_URL` definida en `apps/prueba-005/frontend/.env.local` para conectarse al backend.
 
