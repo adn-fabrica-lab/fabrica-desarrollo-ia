@@ -6,6 +6,7 @@ from qdrant_client import QdrantClient
 COLECCION_POR_AREA = {
     "backend": "docs_nestjs",
     "frontend": "docs_nextjs",
+    "db": "docs_prisma",
 }
 
 _cliente = None
@@ -22,9 +23,9 @@ def _obtener_cliente() -> QdrantClient:
 
 
 def consultar_rag(consulta: str, area: str, limite: int = 3) -> list[str]:
-    """Devuelve fragmentos de documentacion oficial relevantes a la consulta.
+    """Devuelve fragmentos de documentacion oficial y skills relevantes.
 
-    area: "backend" (NestJS), "frontend" (Next.js) o "ambas".
+    area: "backend" (NestJS), "frontend" (Next.js), "db" (Prisma) o "ambas".
     Si la coleccion no existe o Qdrant no responde, devuelve una lista vacia:
     el grafo sigue funcionando igual que en la Fase 2, solo sin contexto extra.
     """

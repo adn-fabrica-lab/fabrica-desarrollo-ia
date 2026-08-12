@@ -4,6 +4,8 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 
 from langgraph.types import interrupt
 from models import obtener_modelo
@@ -14,6 +16,16 @@ RUTA_TRABAJO = "/app/workspace"
 RUTA_SANDBOX = "/sandbox-workspace"  # mismo volumen que /workspace del sandbox
 CONTENEDOR_SANDBOX = "fabrica_sandbox"
 TOPE_CICLOS = 3
+
+
+def obtener_db_uri_proyectos() -> str:
+    """Devuelve la URI de conexion al PostgreSQL exclusivo para proyectos."""
+    pg_user = os.environ["PROJECTS_POSTGRES_USER"]
+    pg_password = os.environ["PROJECTS_POSTGRES_PASSWORD"]
+    pg_host = os.environ["PROJECTS_POSTGRES_HOST"]
+    pg_port = os.environ["PROJECTS_POSTGRES_PORT"]
+    pg_db = os.environ["PROJECTS_POSTGRES_DB"]
+    return f"postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}"
 
 
 def _limpiar_json(texto: str) -> str:
@@ -216,6 +228,72 @@ def nodo_coordinador(estado: EstadoFabricaDesarrollo) -> dict:
     return {"encargo": encargo, "encargo_id": datos["encargo_id"]}
 
 
+def _listar_archivos_relevantes(ruta: str) -> list[str]:
+    archivos = []
+    for root, dirs, files in os.walk(ruta):
+        dirs[:] = [
+            d for d in dirs
+            if d not in {"node_modules", ".git", "dist", ".next", "coverage", "build"}
+        ]
+        for f in files:
+            if f.endswith((".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".prisma", ".css")):
+                archivos.append(os.path.relpath(os.path.join(root, f), ruta))
+    return sorted(archivos)
+
+
+def _leer_archivo_limitado(ruta: str, max_chars: int = 3000) -> str:
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            return f.read(max_chars)
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _resumen_proyecto_existente(destino: str) -> dict:
+    resumen = {"estructura": [], "archivos_destacados": {}}
+    if not os.path.isdir(destino):
+        return resumen
+    estructura = _listar_archivos_relevantes(destino)
+    resumen["estructura"] = estructura[:200]
+    for rel in estructura:
+        rel_lower = rel.lower()
+        if rel_lower in {
+            "backend/package.json",
+            "frontend/package.json",
+            "readme.md",
+            "backend/prisma/schema.prisma",
+        } or rel_lower.endswith("/app.module.ts"):
+            resumen["archivos_destacados"][rel] = _leer_archivo_limitado(
+                os.path.join(destino, rel)
+            )
+    return resumen
+
+
+def nodo_cargar_proyecto_existente(estado: EstadoFabricaDesarrollo) -> dict:
+    print("1b. Verificando si el proyecto ya existe en GitHub...")
+    repo = estado["encargo"].get("repositorio", "")
+    if not repo:
+        print("   No se indico repositorio. Se asume proyecto nuevo.")
+        return {"proyecto_existente": False, "estado_actual_proyecto": {}}
+    org = os.environ["GITHUB_ORG"]
+    token = os.environ["GITHUB_TOKEN"]
+    if not _repo_existe(org, repo, token):
+        print(f"   Repositorio {org}/{repo} no existe. Proyecto nuevo.")
+        return {"proyecto_existente": False, "estado_actual_proyecto": {}}
+    print(f"   Repositorio {org}/{repo} existe. Cargando estado actual...")
+    url = f"https://x-access-token:{token}@github.com/{org}/{repo}.git"
+    # Se clona en el workspace compartido con el sandbox usando el encargo_id
+    # como carpeta para que el sandbox lo reconozca como el proyecto a verificar.
+    destino = os.path.join(RUTA_TRABAJO, estado["encargo_id"])
+    if os.path.exists(destino):
+        shutil.rmtree(destino)
+    os.makedirs(RUTA_TRABAJO, exist_ok=True)
+    subprocess.run(["git", "clone", url, destino], check=True, capture_output=True)
+    resumen = _resumen_proyecto_existente(destino)
+    print(f"   Proyecto cargado. Archivos: {len(resumen['estructura'])}")
+    return {"proyecto_existente": True, "estado_actual_proyecto": resumen}
+
+
 def nodo_arquitecto(estado: EstadoFabricaDesarrollo) -> dict:
     print("2. Arquitecto: disenando el plan tecnico (backend + frontend)...")
     consulta = (
@@ -226,6 +304,8 @@ def nodo_arquitecto(estado: EstadoFabricaDesarrollo) -> dict:
     contexto = {
         "encargo": estado["encargo"],
         "documentacion": consultar_rag(consulta, "ambas", limite=2),
+        "proyecto_existente": estado.get("proyecto_existente", False),
+        "estado_actual_proyecto": estado.get("estado_actual_proyecto") or {},
         # NUEVO Fase 4: si un humano rechazo el plan o el resultado final,
         # sus comentarios y el plan anterior viajan como contexto.
         "comentarios_de_revision_humana": estado.get("comentarios_humanos") or "",
@@ -235,18 +315,29 @@ def nodo_arquitecto(estado: EstadoFabricaDesarrollo) -> dict:
         "arquitecto",
         "Eres el Arquitecto de Software de una fabrica de desarrollo. "
         "El proyecto tiene un backend NestJS (TypeScript) en la carpeta "
-        "backend/ y un frontend Next.js (TypeScript, App Router) en la "
-        "carpeta frontend/. A partir del encargo, produce un plan tecnico "
+        "backend/ y un frontend Next.js (TypeScript, App Router, Tailwind CSS "
+        "y componentes Shadcn/ui) en la carpeta frontend/. A partir del encargo, "
+        "produce un plan tecnico "
         "JSON con esta forma exacta: "
         '{"resumen": "...", '
+        '"requiere_db": true, '
         '"contrato_api": [{"metodo": "GET", "ruta": "/...", '
         '"respuesta_ejemplo": {}}], '
+        '"archivos_db": [{"ruta": "backend/...", "accion": "crear", '
+        '"descripcion": "..."}], '
         '"archivos_backend": [{"ruta": "backend/...", "accion": "crear", '
         '"descripcion": "..."}], '
         '"archivos_frontend": [{"ruta": "frontend/...", "accion": "crear", '
         '"descripcion": "..."}]}. '
+        "requiere_db es true solo si el encargo necesita persistencia en base "
+        "de datos; de lo contrario false. archivos_db solo se incluyen cuando "
+        "requiere_db es true (schema.prisma, migraciones, seed, etc.). "
         "El contrato_api es la unica fuente de verdad de los endpoints: "
-        "backend y frontend deben implementarlo tal cual. Incluye TODOS los "
+        "backend y frontend deben implementarlo tal cual. Si proyecto_existente "
+        "es true, revisa estado_actual_proyecto y genera un plan de mejora o "
+        "continuacion. No dupliques archivos ni funcionalidades que ya existan; "
+        "indica accion 'modificar' para archivos que debas cambiar y 'crear' "
+        "solo para archivos nuevos. Incluye TODOS los "
         "archivos necesarios para que cada proyecto sea completo e instalable "
         "(package.json con script build, tsconfig.json, src/..., app/...). "
         "Si los criterios piden pruebas unitarias, incluye los archivos "
@@ -262,7 +353,53 @@ def nodo_arquitecto(estado: EstadoFabricaDesarrollo) -> dict:
     )
     # Fase 4: la aprobacion ya no es automatica; la decide el humano en el
     # nodo checkpoint_plan.
-    return {"plan_tecnico": plan}
+    return {"plan_tecnico": plan, "requiere_db": bool(plan.get("requiere_db"))}
+
+
+def nodo_agente_base_datos(estado: EstadoFabricaDesarrollo) -> dict:
+    print("2b. Agente de Base de Datos: generando schema y modelos (Prisma)...")
+    plan = estado["plan_tecnico"]
+    archivos_del_plan = plan.get("archivos_db") or []
+    actuales = {
+        a["ruta"]: a["contenido"] for a in (estado.get("archivos_db") or [])
+    }
+    resultado = []
+    for archivo in archivos_del_plan:
+        ruta = archivo["ruta"]
+        print("   Escribiendo " + ruta + "...")
+        contexto = {
+            "encargo": estado["encargo"],
+            "contrato_api": plan.get("contrato_api"),
+            "archivo_a_escribir": archivo,
+            "contenido_actual": actuales.get(ruta),
+            "database_url_proyectos": obtener_db_uri_proyectos(),
+            "documentacion": consultar_rag(
+                (archivo.get("descripcion") or "") + " " + ruta, "db", limite=2
+            ),
+        }
+        instrucciones = (
+            "Eres el Especialista en Base de Datos de una fabrica de software. "
+            "El backend usa NestJS + Prisma + PostgreSQL. El servidor de base "
+            "de datos esta en DATABASE_URL del contexto. documentacion trae "
+            "fragmentos de la documentacion oficial y skills de Prisma: sigue "
+            "sus patrones y convenciones. Escribe el contenido COMPLETO de UN SOLO "
+            "archivo: el indicado en archivo_a_escribir. "
+            "Si el archivo es schema.prisma, define un datasource db con provider \"postgresql\" "
+            "y url env(\"DATABASE_URL\"), luego modelos coherentes con el contrato_api. "
+            "Incluye un generator client con provider \"prisma-client-js\". "
+            "Si el archivo es seed.ts o seed.js, usa PrismaClient para poblar datos "
+            "de ejemplo coherentes con el encargo. No escribas credenciales en el "
+            "archivo: usa la variable de entorno DATABASE_URL. "
+            "Responde JSON con esta forma exacta: "
+            '{"contenido": "..."}.'
+        )
+        datos = _pedir_json(
+            "base_datos",
+            instrucciones,
+            json.dumps(contexto, ensure_ascii=False),
+        )
+        resultado.append({"ruta": ruta, "contenido": datos["contenido"]})
+    return {"archivos_db": resultado}
 
 
 def _programar_por_archivos(area: str, estado: EstadoFabricaDesarrollo) -> list[dict]:
@@ -282,7 +419,7 @@ def _programar_por_archivos(area: str, estado: EstadoFabricaDesarrollo) -> list[
     if area == "backend":
         rol_descripcion = "Programador Backend (NestJS + TypeScript)"
     else:
-        rol_descripcion = "Programador Frontend (Next.js + TypeScript, App Router)"
+        rol_descripcion = "Programador Frontend (Next.js + TypeScript, App Router, Tailwind CSS y Shadcn/ui)"
 
     resultado = []
     for archivo in archivos_del_plan:
@@ -298,12 +435,14 @@ def _programar_por_archivos(area: str, estado: EstadoFabricaDesarrollo) -> list[
             "criterios_del_encargo": estado["encargo"].get("criterios"),
             "resumen_plan": plan.get("resumen"),
             "contrato_api": plan.get("contrato_api"),
+            "requiere_db": plan.get("requiere_db", False),
             "rutas_de_todo_el_plan": [a.get("ruta") for a in archivos_del_plan],
             "archivo_a_escribir": archivo,
             "contenido_actual": actuales.get(ruta),
             "otros_archivos_del_area": {
                 k: v for k, v in actuales.items() if k != ruta
             },
+            "archivos_db": estado.get("archivos_db") or [],
             "hallazgos_a_corregir": [
                 h for h in graves if h.get("ruta") in (None, "", ruta)
             ],
@@ -326,31 +465,49 @@ def _programar_por_archivos(area: str, estado: EstadoFabricaDesarrollo) -> list[
             "el id no exista. documentacion trae fragmentos de la "
             "documentacion oficial de NestJS: sigue sus patrones y convenciones. "
             "Si hallazgos_a_corregir tiene elementos, corrige esos problemas "
-            "partiendo de contenido_actual. Si el archivo es package.json, "
-            "incluye @nestjs/platform-express en dependencies, "
-            "@nestjs/testing en devDependencies cuando exista algun "
-            ".spec.ts, y usa versiones reales publicadas: "
+            "partiendo de contenido_actual. El plan indica si requiere_db es true; "
+            "si lo es, el backend usa Prisma para PostgreSQL. archivos_db trae los "
+            "archivos generados por el especialista de base de datos (schema.prisma, etc.). "
+            "Si el archivo es package.json, incluye @nestjs/platform-express en dependencies, "
+            "@nestjs/testing en devDependencies cuando exista algun .spec.ts. Si requiere_db "
+            "es true, incluye prisma y @prisma/client en dependencies (o prisma en devDependencies), "
+            "y agrega un script \"db:migrate\": \"prisma migrate dev\". Usa versiones reales publicadas: "
             "@types/jest ^29.5.14 (NO ^29.7.0, no existe), jest ^29.7.0, "
-            "@types/node ^20.11.0, @types/express ^4.17.21. "
+            "@types/node ^20.11.0, @types/express ^4.17.21, prisma ^5.15.0, "
+            "@prisma/client ^5.15.0. Si escribes src/prisma.service.ts, inyecta PrismaClient "
+            "como provider y exportalo para los modulos que lo necesiten. No escribas credenciales; "
+            "usa DATABASE_URL desde variables de entorno. "
             "Asegurate de que cualquier regex JSON use doble barra invertida "
             "(\\\\.) para escapes validos. "
             "Responde JSON con esta forma exacta: "
             '{"contenido": "..."}.'
         )
         instrucciones_frontend = (
-            "Eres el Programador Frontend (Next.js + TypeScript, App Router). "
-            "Escribe el contenido COMPLETO de UN SOLO archivo: el indicado en "
-            "archivo_a_escribir. Debe ser coherente con contrato_api y con "
-            "rutas_de_todo_el_plan. documentacion trae fragmentos de la "
-            "documentacion oficial de Next.js: sigue sus patrones y "
+            "Eres el Programador Frontend (Next.js + TypeScript, App Router, "
+            "Tailwind CSS y Shadcn/ui). Escribe el contenido COMPLETO de UN SOLO "
+            "archivo: el indicado en archivo_a_escribir. Debe ser coherente con "
+            "contrato_api y con rutas_de_todo_el_plan. documentacion trae fragmentos "
+            "de la documentacion oficial de Next.js: sigue sus patrones y "
             "convenciones. Si hallazgos_a_corregir tiene elementos, corrige "
             "esos problemas partiendo de contenido_actual. Si el archivo es "
             "package.json, NO definas un script 'lint' e incluye scripts "
             "'dev' (usa 'next dev -p 3002' para evitar el puerto 3000 de "
-            "Grafana), 'build' y 'start'. Si el archivo es .env.local, define "
-            "EXACTAMENTE NEXT_PUBLIC_API_URL=http://localhost:3001 (el backend "
-            "corre en el puerto 3001). Usa versiones publicadas y estables; "
-            "ante la duda usa un rango amplio. "
+            "Grafana), 'build' y 'start'. Incluye las dependencias necesarias para "
+            "Tailwind CSS (tailwindcss, postcss, autoprefixer) y para Shadcn/ui "
+            "(class-variance-authority, clsx, tailwind-merge, lucide-react, "
+            "@radix-ui/* segun el componente). Si el archivo es tailwind.config.ts, "
+            "configura content para incluir './app/**/*.{js,ts,jsx,tsx,mdx}', "
+            "'./components/**/*.{js,ts,jsx,tsx,mdx}' y cualquier ruta adicional "
+            "que uses. Si el archivo es postcss.config.mjs o postcss.config.js, "
+            "incluye los plugins tailwindcss y autoprefixer. Si el archivo es "
+            "app/globals.css, incluye las directivas @tailwind base; "
+            "@tailwind components; @tailwind utilities;. Si el archivo es un "
+            "componente de Shadcn/ui, crea componentes reutilizables en la carpeta "
+            "components/ui/ con los estilos de Tailwind y las utilidades cn() para "
+            "combinar clases. Si el archivo es .env.local, define EXACTAMENTE "
+            "NEXT_PUBLIC_API_URL=http://localhost:3001 (el backend corre en el "
+            "puerto 3001). Usa versiones publicadas y estables; ante la duda usa "
+            "un rango amplio. "
             "Responde JSON con esta forma exacta: "
             '{"contenido": "..."}.'
         )
@@ -437,7 +594,7 @@ def _scripts_npm(carpeta: str) -> dict:
         return {}
 
 
-def _correr_en_sandbox(carpeta: str) -> dict:
+def _correr_en_sandbox(carpeta: str, correr_prisma_migrate: bool = False) -> dict:
     # Cada paso se corre y reporta POR SEPARADO (leccion de la
     # Fase 2: el install encadenado con --silent escondia la causa real).
     # test y lint solo corren si el proyecto define esos scripts.
@@ -446,6 +603,17 @@ def _correr_en_sandbox(carpeta: str) -> dict:
     }
     if not resultado["install"]["ok"]:
         return resultado
+
+    if correr_prisma_migrate:
+        db_url = obtener_db_uri_proyectos()
+        # db push sincroniza el schema con la base de datos sin interaccion.
+        resultado["db:push"] = _correr_paso(
+            carpeta,
+            f"export DATABASE_URL='{db_url}' && npx prisma db push --accept-data-loss",
+        )
+        if not resultado["db:push"]["ok"]:
+            return resultado
+
     resultado["build"] = _correr_paso(carpeta, "npm run build")
     scripts = _scripts_npm(carpeta)
     if "test" in scripts:
@@ -460,9 +628,10 @@ def nodo_sandbox(estado: EstadoFabricaDesarrollo) -> dict:
     raiz = os.path.join(RUTA_SANDBOX, estado["encargo_id"])
     # Igual que en la Fase 2: no se borra la carpeta (node_modules en cache);
     # los archivos fuente se sobreescriben con la version mas reciente.
+    archivos_db = estado.get("archivos_db") or []
     for archivo in (estado["archivos_backend"] or []) + (
         estado.get("archivos_frontend") or []
-    ):
+    ) + archivos_db:
         ruta = os.path.join(raiz, archivo["ruta"])
         os.makedirs(os.path.dirname(ruta), exist_ok=True)
         with open(ruta, "w", encoding="utf-8") as f:
@@ -481,7 +650,10 @@ def nodo_sandbox(estado: EstadoFabricaDesarrollo) -> dict:
                 _quitar_lint_frontend(ruta_pkg)
                 _normalizar_env_local(os.path.join(ruta_area, ".env.local"))
             print("   Verificando " + area + "...")
-            pasos = _correr_en_sandbox(estado["encargo_id"] + "/" + area)
+            pasos = _correr_en_sandbox(
+                estado["encargo_id"] + "/" + area,
+                correr_prisma_migrate=(area == "backend" and bool(archivos_db)),
+            )
             resultado[area] = pasos
             for paso, res in pasos.items():
                 print("   " + area + " " + paso + ": " + ("OK" if res["ok"] else "FALLO"))
@@ -543,24 +715,67 @@ def decidir_despues_de_revision(estado: EstadoFabricaDesarrollo) -> str:
     return "repositorio"
 
 
+def _repo_existe(org: str, repo: str, token: str) -> bool:
+    url = f"https://api.github.com/repos/{org}/{repo}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+
+def _crear_repo_github(org: str, repo: str, token: str) -> None:
+    url = f"https://api.github.com/orgs/{org}/repos"
+    body = json.dumps({"name": repo, "private": True}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        print(f"   Repositorio creado en GitHub: {org}/{repo} (status {resp.status})")
+
+
 def nodo_repositorio(estado: EstadoFabricaDesarrollo) -> dict:
     print("8. Agente de Repositorio: publicando el codigo en una rama...")
     org = os.environ["GITHUB_ORG"]
-    usuario = os.environ["GITHUB_USER"]
     token = os.environ["GITHUB_TOKEN"]
     repo = estado["encargo"]["repositorio"]
     rama = "encargo/" + estado["encargo_id"]
-    url = "https://" + usuario + ":" + token + "@github.com/" + org + "/" + repo + ".git"
+    url = f"https://x-access-token:{token}@github.com/{org}/{repo}.git"
     destino = os.path.join(RUTA_TRABAJO, repo)
+
+    if not _repo_existe(org, repo, token):
+        print(f"   El repositorio {org}/{repo} no existe. Creandolo...")
+        _crear_repo_github(org, repo, token)
 
     if os.path.exists(destino):
         shutil.rmtree(destino)
     os.makedirs(RUTA_TRABAJO, exist_ok=True)
     subprocess.run(["git", "clone", url, destino], check=True)
+    # Partir de la rama principal (main o master) para crear la rama del encargo.
+    rama_principal = "main"
+    res = subprocess.run(
+        ["git", "rev-parse", "--verify", "origin/main"],
+        cwd=destino, capture_output=True,
+    )
+    if res.returncode != 0:
+        rama_principal = "master"
+    subprocess.run(["git", "checkout", rama_principal], cwd=destino, check=True)
     subprocess.run(["git", "checkout", "-b", rama], cwd=destino, check=True)
 
-    archivos = (estado["archivos_backend"] or []) + (
-        estado.get("archivos_frontend") or []
+    archivos = (
+        (estado.get("archivos_db") or [])
+        + (estado["archivos_backend"] or [])
+        + (estado.get("archivos_frontend") or [])
     )
     for archivo in archivos:
         ruta = os.path.join(destino, archivo["ruta"])
@@ -589,6 +804,22 @@ def nodo_repositorio(estado: EstadoFabricaDesarrollo) -> dict:
     )
     print("   Rama publicada: " + rama)
     return {"rama_git": rama}
+
+
+def nodo_notificacion_final(estado: EstadoFabricaDesarrollo) -> dict:
+    print("\n" + "=" * 60)
+    print("FABRICA LISTA PARA PRUEBAS AVANZADAS")
+    print("=" * 60)
+    print("El codigo se genero, verifico en sandbox y publico en GitHub.")
+    print("Rama publicada: " + str(estado.get("rama_git", "")))
+    print("Ciclos de revision: " + str(estado.get("ciclo", 0)))
+    print("\nPasos sugeridos para pruebas avanzadas:")
+    print("- Revisar la rama en GitHub y crear un Pull Request.")
+    print("- Desplegar el backend y frontend en un entorno de staging.")
+    print("- Ejecutar pruebas end-to-end y de integracion.")
+    print("- Validar la base de datos con datos reales si aplica.")
+    print("=" * 60 + "\n")
+    return {}
 
 
 # --- NUEVO Fase 4: checkpoints humanos por terminal (S10 del plan) ---
@@ -625,11 +856,14 @@ def nodo_checkpoint_plan(estado: EstadoFabricaDesarrollo) -> dict:
 
 
 def decidir_despues_de_checkpoint_plan(estado: EstadoFabricaDesarrollo) -> str:
-    if estado.get("plan_aprobado"):
-        print("   Plan aprobado por el humano. A programar.")
-        return "backend"
-    print("   Plan rechazado. Vuelve al Arquitecto con tus comentarios.")
-    return "arquitecto"
+    if not estado.get("plan_aprobado"):
+        print("   Plan rechazado. Vuelve al Arquitecto con tus comentarios.")
+        return "arquitecto"
+    print("   Plan aprobado por el humano. A programar.")
+    if estado.get("requiere_db"):
+        print("   El plan requiere base de datos. Activando Especialista de BD.")
+        return "base_datos"
+    return "backend"
 
 
 def _archivos_faltantes_del_plan(estado: EstadoFabricaDesarrollo) -> list[str]:

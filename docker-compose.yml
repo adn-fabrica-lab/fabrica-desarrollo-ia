@@ -13,6 +13,20 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  postgres_proyectos:
+    image: postgres:16
+    container_name: fabrica_postgres_proyectos
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${PROJECTS_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${PROJECTS_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${PROJECTS_POSTGRES_DB:-fabrica_proyectos}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_proyectos_data:/var/lib/postgresql/data
+
   qdrant:
     image: qdrant/qdrant:latest
     container_name: fabrica_qdrant
@@ -49,6 +63,7 @@ services:
 
 volumes:
   postgres_data:
+  postgres_proyectos_data:
   qdrant_data:
   sandbox_workspace:
 

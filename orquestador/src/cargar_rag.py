@@ -13,18 +13,26 @@ import tempfile
 
 from qdrant_client import QdrantClient
 
+from skills import obtener_skills_para_area
+
 FUENTES = {
     "nestjs": {
         "coleccion": "docs_nestjs",
+        "skills_area": "backend",
         "repo": "https://github.com/nestjs/docs.nestjs.com.git",
         "carpeta_docs": "content",
         "extensiones": (".md",),
     },
     "nextjs": {
         "coleccion": "docs_nextjs",
+        "skills_area": "frontend",
         "repo": "https://github.com/vercel/next.js.git",
         "carpeta_docs": "docs",
         "extensiones": (".md", ".mdx"),
+    },
+    "prisma": {
+        "coleccion": "docs_prisma",
+        "skills_area": "db",
     },
 }
 
@@ -56,24 +64,46 @@ def descargar_docs(fuente: dict, destino: str) -> str:
     return os.path.join(destino, fuente["carpeta_docs"])
 
 
+def _fragmentar_skills(skills: list[dict]) -> tuple[list[str], list[dict]]:
+    documentos, metadatos = [], []
+    for skill in skills:
+        for fragmento in fragmentar(skill["contenido"]):
+            documentos.append(fragmento)
+            metadatos.append({"fuente": "skills.sh", "skill_id": skill["id"], "skill_name": skill["name"]})
+    return documentos, metadatos
+
+
 def cargar_fuente(cliente: QdrantClient, nombre: str) -> None:
     fuente = FUENTES[nombre]
-    print("Descargando documentacion de " + nombre + "...")
     documentos, metadatos = [], []
-    with tempfile.TemporaryDirectory() as tmp:
-        raiz = descargar_docs(fuente, tmp)
-        for carpeta, _, archivos in os.walk(raiz):
-            for archivo in archivos:
-                if not archivo.endswith(fuente["extensiones"]):
-                    continue
-                ruta = os.path.join(carpeta, archivo)
-                with open(ruta, "r", encoding="utf-8", errors="ignore") as f:
-                    texto = f.read()
-                relativa = os.path.relpath(ruta, raiz)
-                for fragmento in fragmentar(texto):
-                    documentos.append(fragmento)
-                    metadatos.append({"fuente": nombre, "archivo": relativa})
-    print("   " + str(len(documentos)) + " fragmentos extraidos.")
+
+    if fuente.get("repo"):
+        print("Descargando documentacion de " + nombre + "...")
+        with tempfile.TemporaryDirectory() as tmp:
+            raiz = descargar_docs(fuente, tmp)
+            for carpeta, _, archivos in os.walk(raiz):
+                for archivo in archivos:
+                    if not archivo.endswith(fuente["extensiones"]):
+                        continue
+                    ruta = os.path.join(carpeta, archivo)
+                    with open(ruta, "r", encoding="utf-8", errors="ignore") as f:
+                        texto = f.read()
+                    relativa = os.path.relpath(ruta, raiz)
+                    for fragmento in fragmentar(texto):
+                        documentos.append(fragmento)
+                        metadatos.append({"fuente": nombre, "archivo": relativa})
+        print("   " + str(len(documentos)) + " fragmentos extraidos.")
+
+    # Integrar skills.sh relevantes para el area de esta fuente.
+    skills_area = fuente.get("skills_area")
+    if skills_area:
+        print("   Descargando skills de skills.sh para el area " + skills_area + "...")
+        skills = obtener_skills_para_area(skills_area, top_n=3)
+        print("   Skills descargadas: " + str(len(skills)))
+        docs_skills, meta_skills = _fragmentar_skills(skills)
+        documentos.extend(docs_skills)
+        metadatos.extend(meta_skills)
+
     if cliente.collection_exists(fuente["coleccion"]):
         cliente.delete_collection(fuente["coleccion"])
     print("   Generando embeddings y cargando en Qdrant (varios minutos)...")

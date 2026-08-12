@@ -6,7 +6,9 @@ from langgraph.graph import StateGraph, END
 from state import EstadoFabricaDesarrollo
 from agentes import (
     nodo_coordinador,
+    nodo_cargar_proyecto_existente,
     nodo_arquitecto,
+    nodo_agente_base_datos,
     nodo_checkpoint_plan,
     nodo_programador_backend,
     nodo_programador_frontend,
@@ -15,6 +17,7 @@ from agentes import (
     nodo_revisor,
     nodo_checkpoint_final,
     nodo_repositorio,
+    nodo_notificacion_final,
     decidir_despues_de_checkpoint_plan,
     decidir_despues_de_backend,
     decidir_despues_de_revision,
@@ -38,8 +41,10 @@ def construir_grafo(checkpointer):
     builder = StateGraph(EstadoFabricaDesarrollo)
 
     builder.add_node("coordinador", nodo_coordinador)
+    builder.add_node("cargar_proyecto_existente", nodo_cargar_proyecto_existente)
     builder.add_node("arquitecto", nodo_arquitecto)
     builder.add_node("checkpoint_plan", nodo_checkpoint_plan)
+    builder.add_node("base_datos", nodo_agente_base_datos)
     builder.add_node("backend", nodo_programador_backend)
     builder.add_node("frontend", nodo_programador_frontend)
     builder.add_node("integrador", nodo_integrador)
@@ -47,15 +52,18 @@ def construir_grafo(checkpointer):
     builder.add_node("revisor", nodo_revisor)
     builder.add_node("checkpoint_final", nodo_checkpoint_final)
     builder.add_node("repositorio", nodo_repositorio)
+    builder.add_node("notificacion_final", nodo_notificacion_final)
 
     builder.set_entry_point("coordinador")
-    builder.add_edge("coordinador", "arquitecto")
+    builder.add_edge("coordinador", "cargar_proyecto_existente")
+    builder.add_edge("cargar_proyecto_existente", "arquitecto")
     builder.add_edge("arquitecto", "checkpoint_plan")
     builder.add_conditional_edges(
         "checkpoint_plan",
         decidir_despues_de_checkpoint_plan,
-        {"backend": "backend", "arquitecto": "arquitecto"},
+        {"base_datos": "base_datos", "backend": "backend", "arquitecto": "arquitecto"},
     )
+    builder.add_edge("base_datos", "backend")
     builder.add_conditional_edges(
         "backend",
         decidir_despues_de_backend,
@@ -81,6 +89,7 @@ def construir_grafo(checkpointer):
         decidir_despues_de_checkpoint_final,
         {"repositorio": "repositorio", "arquitecto": "arquitecto"},
     )
-    builder.add_edge("repositorio", END)
+    builder.add_edge("repositorio", "notificacion_final")
+    builder.add_edge("notificacion_final", END)
 
     return builder.compile(checkpointer=checkpointer)

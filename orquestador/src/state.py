@@ -5,8 +5,12 @@ from typing import TypedDict
 class EstadoFabricaDesarrollo(TypedDict):
     encargo_id: str
     encargo: dict
+    proyecto_existente: bool
+    estado_actual_proyecto: dict
     plan_tecnico: dict
     plan_aprobado: bool
+    requiere_db: bool
+    archivos_db: list[dict]
     archivos_backend: list[dict]
     archivos_frontend: list[dict]
     hallazgos_revision: list[dict]
